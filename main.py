@@ -1,68 +1,48 @@
 import os
 import telebot
 from telebot import types
-import requests
+import google.generativeai as genai
 import json
-from datetime import datetime
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY') # For smart analysis
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# Setup Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash') # Fast and free model
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Authorized Team Members (Telegram User IDs)
+# Authorized Team Members
 AUTHORIZED_USERS = os.environ.get('AUTHORIZED_USERS', '').split(',')
 
 def is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
-# --- AI ANALYSIS FUNCTION ---
-def get_ai_analysis(offensive_text, platform="Instagram"):
-    """Uses OpenAI to analyze the violation and give a strategy"""
-    
-    if not OPENAI_API_KEY:
-        return {
-            "violations": ["Manual Review Needed"],
-            "severity": "MEDIUM",
-            "report_count": 5,
-            "strategy": "Please use manual reporting guidelines."
-        }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+# --- GEMINI AI ANALYSIS ---
+def get_gemini_analysis(text, platform):
+    """Uses Google Gemini to analyze violation and give strategy"""
     
     prompt = f"""
     Act as a Social Media Safety Expert for {platform}.
-    Analyze this offensive text: "{offensive_text}"
+    Analyze this text: "{text}"
     
-    Provide output in JSON format with:
-    1. 'violation_types': List of specific violations (e.g., 'Hate Speech', 'Harassment', 'Adult Content', 'Self-Harm').
-    2. 'severity': LOW, MEDIUM, HIGH, or CRITICAL.
-    3. 'estimated_reports': Number of reports needed to get account banned/actioned (e.g., 5-10).
-    4. 'reporting_category': The exact category to select in the app.
-    5. 'reasoning': Short explanation why.
+    Identify if it contains: Hate Speech, Harassment, Adult Content, or Threats.
+    
+    Return ONLY a JSON object with these keys:
+    1. "violation_type": (e.g., 'Hate Speech', 'Harassment', 'None')
+    2. "severity": ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')
+    3. "reports_needed": (Number, e.g., 5, 10, 15)
+    4. "report_category": (Exact category name to select in app)
+    5. "reason": (Short reason in Hindi/English)
     """
-
-    data = {
-        "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
-    }
-
+    
     try:
-        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data)
-        result = response.json()
-        content = result['choices'][0]['message']['content']
-        
-        # Clean JSON from response
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        json_str = content[start:end]
-        
-        return json.loads(json_str)
+        response = model.generate_content(prompt)
+        # Clean response to get pure JSON
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
     except Exception as e:
         return {"error": str(e)}
 
@@ -72,43 +52,41 @@ def get_ai_analysis(offensive_text, platform="Instagram"):
 def send_welcome(message):
     if not is_authorized(message.from_user.id):
         return
-    bot.reply_to(message, "👋 Welcome! Send me:\n1. Screenshot of ID\n2. Screenshot of Gali/Comment\n3. Platform Name (Insta/Telegram)")
+    bot.reply_to(message, "👋 Welcome! Use /analyze to start smart investigation.")
 
 @bot.message_handler(commands=['analyze'])
 def start_analysis(message):
     if not is_authorized(message.from_user.id):
         return
     
-    msg = bot.send_message(message.chat.id, "📸 Step 1: Send screenshot of the User's ID/Profile.")
+    msg = bot.send_message(message.chat.id, "📸 Step 1: Send screenshot of User ID.")
     bot.register_next_step_handler(msg, get_id_ss)
 
 def get_id_ss(message):
     if message.photo:
-        msg = bot.send_message(message.chat.id, "💬 Step 2: Send screenshot of the Gali/Offensive Comment.")
+        msg = bot.send_message(message.chat.id, "💬 Step 2: Send screenshot of the Gali/Comment.")
         bot.register_next_step_handler(msg, get_gali_ss)
     else:
-        bot.reply_to(message, "❌ Please send a valid image.")
+        bot.reply_to(message, "❌ Please send an image.")
 
 def get_gali_ss(message):
     if message.photo:
-        msg = bot.send_message(message.chat.id, "📱 Step 3: Which platform? (Instagram / Telegram / Twitter)")
+        msg = bot.send_message(message.chat.id, "📱 Step 3: Platform Name? (Instagram/Telegram)")
         bot.register_next_step_handler(msg, get_platform)
     else:
-        bot.reply_to(message, "❌ Please send a valid image.")
+        bot.reply_to(message, "❌ Please send an image.")
 
 def get_platform(message):
     platform = message.text.strip()
-    msg = bot.send_message(message.chat.id, "✍️ Step 4: Type the exact Gali/Text used in the comment:")
-    bot.register_next_step_handler(msg, process_final_analysis, platform)
+    msg = bot.send_message(message.chat.id, "✍️ Step 4: Type the exact Gali/Text here:")
+    bot.register_next_step_handler(msg, process_final, platform)
 
-def process_final_analysis(message, platform):
+def process_final(message, platform):
     offensive_text = message.text
     
-    # Show processing
-    proc_msg = bot.send_message(message.chat.id, "🤖 AI is analyzing the violation...")
+    proc_msg = bot.send_message(message.chat.id, "🤖 Gemini AI is analyzing...")
     
-    # Get AI Analysis
-    analysis = get_ai_analysis(offensive_text, platform)
+    analysis = get_gemini_analysis(offensive_text, platform)
     
     bot.delete_message(message.chat.id, proc_msg.message_id)
     
@@ -116,43 +94,33 @@ def process_final_analysis(message, platform):
         bot.reply_to(message, f"⚠️ AI Error: {analysis['error']}")
         return
 
-    # Format the Report
-    violations = analysis.get('violation_types', [])
+    # Build Report
+    v_type = analysis.get('violation_type', 'Unknown')
     severity = analysis.get('severity', 'MEDIUM')
-    est_reports = analysis.get('estimated_reports', 5)
-    category = analysis.get('reporting_category', 'Harassment')
+    reports = analysis.get('reports_needed', 5)
+    category = analysis.get('report_category', 'Harassment')
+    reason = analysis.get('reason', 'AI detected violation')
     
     report = f"""
-🔍 **AI INVESTIGATION REPORT**
+🔍 **GEMINI AI INVESTIGATION REPORT**
 ━━━━━━━━━━━━━━━━━━━━
 📱 Platform: {platform}
 ⚠️ Severity: **{severity}**
 
-🚨 **VIOLATIONS DETECTED:**
-"""
-    for v in violations:
-        report += f"• {v}\n"
-    
-    report += f"""
-━━━━━━━━━━━━━━━━━━━━
+🧠 **AI DETECTION:**
+• Type: **{v_type}**
+• Reason: {reason}
+
 📊 **ACTION PLAN:**
-
-🎯 Reports Needed: **{est_reports} Reports**
+🎯 Reports Needed: **{reports} Reports**
 📂 Select Category: **{category}**
-⏰ Timeframe: Next 24 Hours
+⏰ Strategy: Report from different accounts within 24h.
 
-💡 **Strategy:**
-1. Report from {est_reports} different accounts.
-2. Use category: '{category}'.
-3. Attach both screenshots (ID + Gali).
-4. If no action in 24h, escalate to 'Hate Speech'.
-
-✅ **Success Chance:** High (if reported correctly)
+💡 **Pro Tip:** Since AI flagged it as '{v_type}', ensure you select the matching category in the reporting menu for faster action.
 ━━━━━━━━━━━━━━━━━━━━
     """
     
     bot.send_message(message.chat.id, report, parse_mode="Markdown")
 
-# Keep bot alive
-print("🚀 Bot is running on Railway!")
+print("🚀 Bot is running on Railway with Gemini AI!")
 bot.infinity_polling()
