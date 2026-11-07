@@ -16,13 +16,17 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
     print("❌ ERROR: Missing Environment Variables")
     exit()
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Force specific transport and region to avoid v1beta issues
+genai.configure(
+    api_key=GEMINI_API_KEY,
+    transport="rest" 
+)
 
-# Fallback Models List (Order matters: Best -> Stable -> Legacy)
+# Updated Fallback List (Using most stable models first)
 FALLBACK_MODELS = [
+    'gemini-1.5-flash-002',
     'gemini-1.5-flash',
-    'gemini-pro',
-    'gemini-1.0-pro'
+    'gemini-pro'
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN, skip_pending=True)
@@ -39,16 +43,16 @@ def extract_text_from_photo(photo_file_id):
         file_info = bot.get_file(photo_file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         image = Image.open(io.BytesIO(downloaded_file))
+        # Try English first, then Hindi if needed
         text = pytesseract.image_to_string(image, lang='eng+hin')
-        return text.strip()
+        return text.strip() if text.strip() else "No text detected in image."
     except Exception as e:
-        return f"OCR Error: {str(e)}"
+        return f"OCR Failed: {str(e)}"
 
 # --- AI ANALYSIS WITH FALLBACK ---
 def get_gemini_analysis(extracted_text, user_comment, platform):
     last_error = None
     
-    # Try each model one by one
     for model_name in FALLBACK_MODELS:
         try:
             model = genai.GenerativeModel(model_name)
@@ -74,23 +78,21 @@ def get_gemini_analysis(extracted_text, user_comment, platform):
             # Robust JSON Extraction
             json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
             if json_match:
-                json_str = json_match.group(0)
-                return json.loads(json_str)
+                return json.loads(json_match.group(0))
             else:
-                raise ValueError("No JSON found in response")
+                raise ValueError("No JSON found")
                 
         except Exception as e:
             last_error = str(e)
             print(f"⚠️ Model {model_name} failed: {e}")
             continue
     
-    # If all models fail
     return {
         "violation_type": "Manual Review",
         "severity": "MEDIUM",
         "reports_needed": 5,
         "report_category": "Harassment",
-        "reason": f"All AI models failed. Last error: {last_error[:60]}"
+        "reason": f"All AI models failed. Last error: {last_error[:80]}"
     }
 
 # --- BOT HANDLERS ---
@@ -106,7 +108,6 @@ def send_welcome(message):
 def start_analysis(message):
     if not is_authorized(message.from_user.id):
         return
-    
     msg = bot.send_message(message.chat.id, "📸 **Step 1:** Send screenshot of User ID.")
     bot.register_next_step_handler(msg, get_id_ss)
 
@@ -120,7 +121,6 @@ def get_id_ss(message):
 def get_gali_ss(message):
     if message.photo:
         extracted_text = extract_text_from_photo(message.photo[-1].file_id)
-        
         msg = bot.send_message(message.chat.id, "📱 **Step 3:** Platform Name? (Instagram/Telegram)")
         bot.register_next_step_handler(msg, get_platform, extracted_text)
     else:
@@ -135,9 +135,7 @@ def process_final(message, platform, extracted_text):
     user_comment = message.text if message.text.lower() != 'skip' else ""
     
     proc_msg = bot.send_message(message.chat.id, "🤖 Reading screenshot & analyzing...")
-    
     analysis = get_gemini_analysis(extracted_text, user_comment, platform)
-    
     bot.delete_message(message.chat.id, proc_msg.message_id)
     
     v_type = analysis.get('violation_type', 'Unknown')
