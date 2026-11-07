@@ -6,6 +6,7 @@ from PIL import Image
 import pytesseract
 import io
 import json
+import re
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -16,7 +17,13 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
     exit()
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash-exp') 
+
+# Fallback Models List (Order matters: Best -> Stable -> Legacy)
+FALLBACK_MODELS = [
+    'gemini-1.5-flash',
+    'gemini-pro',
+    'gemini-1.0-pro'
+]
 
 bot = telebot.TeleBot(BOT_TOKEN, skip_pending=True)
 
@@ -26,7 +33,7 @@ AUTHORIZED_USERS = [uid.strip() for uid in AUTHORIZED_USERS_STR.split(',') if ui
 def is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
-# --- OCR FUNCTION (Screenshot Reader) ---
+# --- OCR FUNCTION ---
 def extract_text_from_photo(photo_file_id):
     try:
         file_info = bot.get_file(photo_file_id)
@@ -37,37 +44,54 @@ def extract_text_from_photo(photo_file_id):
     except Exception as e:
         return f"OCR Error: {str(e)}"
 
-# --- GEMINI ANALYSIS WITH IMAGE CONTEXT ---
+# --- AI ANALYSIS WITH FALLBACK ---
 def get_gemini_analysis(extracted_text, user_comment, platform):
-    try:
-        prompt = f"""
-        Act as a Social Media Safety Expert for {platform}.
-        
-        Extracted Text from Screenshot: "{extracted_text}"
-        User Provided Context: "{user_comment}"
-        
-        Analyze the violation based on both sources.
-        Return ONLY valid JSON:
-        {{
-            "violation_type": "Hate Speech/Harassment/Adult/Threat",
-            "severity": "LOW/MEDIUM/HIGH/CRITICAL",
-            "reports_needed": Integer (3 to 20),
-            "report_category": "Exact category name for reporting",
-            "reason": "Short explanation in Hindi/English"
-        }}
-        """
-        
-        response = model.generate_content(prompt)
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
-    except Exception as e:
-        return {
-            "violation_type": "Manual Review",
-            "severity": "MEDIUM",
-            "reports_needed": 5,
-            "report_category": "Harassment",
-            "reason": f"AI Error: {str(e)[:50]}"
-        }
+    last_error = None
+    
+    # Try each model one by one
+    for model_name in FALLBACK_MODELS:
+        try:
+            model = genai.GenerativeModel(model_name)
+            
+            prompt = f"""
+            Act as a Social Media Safety Expert for {platform}.
+            Extracted Text from Screenshot: "{extracted_text}"
+            User Context: "{user_comment}"
+            
+            Return ONLY valid JSON with these keys:
+            {{
+                "violation_type": "String",
+                "severity": "LOW/MEDIUM/HIGH/CRITICAL",
+                "reports_needed": Integer,
+                "report_category": "String",
+                "reason": "String"
+            }}
+            """
+            
+            response = model.generate_content(prompt)
+            clean_text = response.text
+            
+            # Robust JSON Extraction
+            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                return json.loads(json_str)
+            else:
+                raise ValueError("No JSON found in response")
+                
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ Model {model_name} failed: {e}")
+            continue
+    
+    # If all models fail
+    return {
+        "violation_type": "Manual Review",
+        "severity": "MEDIUM",
+        "reports_needed": 5,
+        "report_category": "Harassment",
+        "reason": f"All AI models failed. Last error: {last_error[:60]}"
+    }
 
 # --- BOT HANDLERS ---
 
@@ -88,7 +112,6 @@ def start_analysis(message):
 
 def get_id_ss(message):
     if message.photo:
-        # Store ID screenshot temporarily if needed, or just proceed
         msg = bot.send_message(message.chat.id, "💬 **Step 2:** Send screenshot of the Gali/Comment.")
         bot.register_next_step_handler(msg, get_gali_ss)
     else:
@@ -96,7 +119,6 @@ def get_id_ss(message):
 
 def get_gali_ss(message):
     if message.photo:
-        # Extract text immediately from this photo
         extracted_text = extract_text_from_photo(message.photo[-1].file_id)
         
         msg = bot.send_message(message.chat.id, "📱 **Step 3:** Platform Name? (Instagram/Telegram)")
@@ -146,5 +168,5 @@ def process_final(message, platform, extracted_text):
     
     bot.send_message(message.chat.id, report, parse_mode="Markdown")
 
-print("✅ Bot with OCR is running on Railway!")
+print("✅ Bot with Multi-Model Fallback is running on Railway!")
 bot.infinity_polling()
