@@ -2,6 +2,9 @@ import os
 import telebot
 from telebot import types
 import google.generativeai as genai
+from PIL import Image
+import pytesseract
+import io
 import json
 
 # --- CONFIGURATION ---
@@ -12,36 +15,45 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
     print("❌ ERROR: Missing Environment Variables")
     exit()
 
-# Setup Gemini with CORRECT Model Name
 genai.configure(api_key=GEMINI_API_KEY)
-# Updated model name to fix 404 error
 model = genai.GenerativeModel('gemini-2.0-flash-exp') 
 
 bot = telebot.TeleBot(BOT_TOKEN, skip_pending=True)
 
-# Authorized Team Members
 AUTHORIZED_USERS_STR = os.environ.get('AUTHORIZED_USERS', '')
 AUTHORIZED_USERS = [uid.strip() for uid in AUTHORIZED_USERS_STR.split(',') if uid.strip()]
 
 def is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
-# --- GEMINI AI ANALYSIS ---
-def get_gemini_analysis(text, platform):
+# --- OCR FUNCTION (Screenshot Reader) ---
+def extract_text_from_photo(photo_file_id):
+    try:
+        file_info = bot.get_file(photo_file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        image = Image.open(io.BytesIO(downloaded_file))
+        text = pytesseract.image_to_string(image, lang='eng+hin')
+        return text.strip()
+    except Exception as e:
+        return f"OCR Error: {str(e)}"
+
+# --- GEMINI ANALYSIS WITH IMAGE CONTEXT ---
+def get_gemini_analysis(extracted_text, user_comment, platform):
     try:
         prompt = f"""
         Act as a Social Media Safety Expert for {platform}.
-        Analyze this text: "{text}"
         
-        Identify violations: Hate Speech, Harassment, Adult Content, Threats.
+        Extracted Text from Screenshot: "{extracted_text}"
+        User Provided Context: "{user_comment}"
         
-        Return ONLY a valid JSON object with these keys:
+        Analyze the violation based on both sources.
+        Return ONLY valid JSON:
         {{
-            "violation_type": "String",
+            "violation_type": "Hate Speech/Harassment/Adult/Threat",
             "severity": "LOW/MEDIUM/HIGH/CRITICAL",
-            "reports_needed": Integer,
-            "report_category": "String",
-            "reason": "String"
+            "reports_needed": Integer (3 to 20),
+            "report_category": "Exact category name for reporting",
+            "reason": "Short explanation in Hindi/English"
         }}
         """
         
@@ -76,6 +88,7 @@ def start_analysis(message):
 
 def get_id_ss(message):
     if message.photo:
+        # Store ID screenshot temporarily if needed, or just proceed
         msg = bot.send_message(message.chat.id, "💬 **Step 2:** Send screenshot of the Gali/Comment.")
         bot.register_next_step_handler(msg, get_gali_ss)
     else:
@@ -83,22 +96,25 @@ def get_id_ss(message):
 
 def get_gali_ss(message):
     if message.photo:
+        # Extract text immediately from this photo
+        extracted_text = extract_text_from_photo(message.photo[-1].file_id)
+        
         msg = bot.send_message(message.chat.id, "📱 **Step 3:** Platform Name? (Instagram/Telegram)")
-        bot.register_next_step_handler(msg, get_platform)
+        bot.register_next_step_handler(msg, get_platform, extracted_text)
     else:
         bot.reply_to(message, "❌ Please send a valid image.")
 
-def get_platform(message):
+def get_platform(message, extracted_text):
     platform = message.text.strip()
-    msg = bot.send_message(message.chat.id, "✍️ **Step 4:** Type the exact Gali/Text here:")
-    bot.register_next_step_handler(msg, process_final, platform)
+    msg = bot.send_message(message.chat.id, "✍️ **Step 4:** Type any extra context (or type 'skip'):")
+    bot.register_next_step_handler(msg, process_final, platform, extracted_text)
 
-def process_final(message, platform):
-    offensive_text = message.text
+def process_final(message, platform, extracted_text):
+    user_comment = message.text if message.text.lower() != 'skip' else ""
     
-    proc_msg = bot.send_message(message.chat.id, "🤖 Gemini AI is analyzing...")
+    proc_msg = bot.send_message(message.chat.id, "🤖 Reading screenshot & analyzing...")
     
-    analysis = get_gemini_analysis(offensive_text, platform)
+    analysis = get_gemini_analysis(extracted_text, user_comment, platform)
     
     bot.delete_message(message.chat.id, proc_msg.message_id)
     
@@ -117,6 +133,7 @@ def process_final(message, platform):
 🧠 **AI DETECTION:**
 • Type: **{v_type}**
 • Reason: {reason}
+• Extracted Text: "{extracted_text[:100]}..."
 
 📊 **ACTION PLAN:**
 🎯 Reports Needed: **{reports} Reports**
@@ -129,5 +146,5 @@ def process_final(message, platform):
     
     bot.send_message(message.chat.id, report, parse_mode="Markdown")
 
-print("✅ Bot is successfully running on Railway!")
+print("✅ Bot with OCR is running on Railway!")
 bot.infinity_polling()
