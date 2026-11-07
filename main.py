@@ -40,6 +40,11 @@ for _key_name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2"):
         GEMINI_API_KEYS.append(_key)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+try:
+    GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "180000"))
+except ValueError:
+    GEMINI_TIMEOUT_MS = 180_000
+GEMINI_TIMEOUT_MS = max(60_000, min(GEMINI_TIMEOUT_MS, 300_000))
 AUTHORIZED_USERS = {
     item.strip()
     for item in os.getenv("AUTHORIZED_USERS", "").split(",")
@@ -47,8 +52,8 @@ AUTHORIZED_USERS = {
 }
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_IMAGE_SIDE = 4096
-MAX_IMAGE_PIXELS = 24_000_000
+MAX_IMAGE_SIDE = 3072
+MAX_IMAGE_PIXELS = 16_000_000
 MAX_EVIDENCE_IMAGES = 4
 MAX_CONTEXT_CHARS = 3500
 
@@ -341,12 +346,25 @@ def run_gemini_review(
     contents: Any = [prompt, *images] if images else prompt
     errors: list[str] = []
 
-    # Same model, two independent API keys: key 2 is attempted only if key 1 fails.
+    # 504/503/429/5xx can be temporary service or capacity failures. Give each
+    # API key a bounded retry instead of treating a timeout as a bad API key.
+    retry_options = types.HttpRetryOptions(
+        attempts=2,  # maximum total attempts per key, including the first call
+        initial_delay=1.0,
+        max_delay=5.0,
+        exp_base=2.0,
+        jitter=1.0,
+        http_status_codes=[408, 429, 500, 502, 503, 504],
+    )
+
     for index, api_key in enumerate(GEMINI_API_KEYS, start=1):
         try:
             client = genai.Client(
                 api_key=api_key,
-                http_options=types.HttpOptions(timeout=45_000),
+                http_options=types.HttpOptions(
+                    timeout=GEMINI_TIMEOUT_MS,
+                    retry_options=retry_options,
+                ),
             )
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
@@ -367,7 +385,7 @@ def run_gemini_review(
             errors.append(f"API key {index}: {raw_error[:250]}")
             logger.warning("Gemini request failed with API key %d: %s", index, raw_error[:250])
 
-    raise RuntimeError("Both configured Gemini API keys failed. " + " | ".join(errors))
+    raise RuntimeError("Gemini request failed after retry/failover. " + " | ".join(errors))
 
 
 # ---------------------------------------------------------------------------
@@ -669,10 +687,39 @@ def send_long_message(chat_id: int, text: str, limit: int = 3900) -> None:
         remaining = remaining[split_at:].strip()
 
 
+def explain_api_failure(error: str) -> str:
+    """Translate common Gemini API failures into useful, non-misleading advice."""
+    lowered = error.lower()
+    if "504" in lowered or "deadline_exceeded" in lowered:
+        return (
+            "Gemini 504 timeout: Google ka server request ko deadline ke andar complete nahi kar saka. "
+            "Iska matlab zaroori nahi ki API key galat hai. Is build mein 180-second request timeout "
+            "aur temporary errors ke liye automatic retry hai. 30-60 seconds baad dobara try karein; "
+            "agar bahut screenshots bheje the to pehle sirf 1-2 clear screenshots ke saath test karein."
+        )
+    if "429" in lowered or "resource_exhausted" in lowered or "quota" in lowered:
+        return (
+            "Gemini quota/rate limit hit hui hai. Thodi der baad retry karein. Do API keys agar ek hi "
+            "Google AI Studio project ki hain to dono project quota share karti hain."
+        )
+    if "api_key_invalid" in lowered or "api key not valid" in lowered or "401" in lowered or "403" in lowered:
+        return (
+            "Google API key invalid ya permission issue lag raha hai. Railway Variables mein dono keys "
+            "ke naam/values check karein; key ke aage-peeche spaces na hon aur Gemini API access enabled ho."
+        )
+    if "503" in lowered or "service_unavailable" in lowered or "502" in lowered:
+        return "Gemini service abhi temporarily busy/unavailable hai. Kuch der baad /analyze dobara try karein."
+    return (
+        "Railway > Deployments > latest deployment > View Logs mein poora error dekhein. "
+        "API key ko chat mein kabhi share na karein."
+    )
+
+
 def perform_review(chat_id: int, platform: str, account: str, context: str, images: list[Image.Image]) -> None:
     progress = bot.send_message(
         chat_id,
         f"AI review chal raha hai… typed details aur {len(images)} screenshot(s) check kar raha hoon.\n"
+        "Gemini ko 1-3 minute lag sakte hain; beech mein /analyze dobara na bhejein.\n"
         "Bot account ko online open nahi karta; sirf aapke diye details dekhta hai.",
     )
     try:
@@ -687,9 +734,8 @@ def perform_review(chat_id: int, platform: str, account: str, context: str, imag
         bot.send_message(
             chat_id,
             "AI review complete nahi ho saka. Main fake result nahi dunga.\n\n"
-            f"Error: {error[:700]}\n\n"
-            "Railway Variables mein GEMINI_API_KEY aur GEMINI_API_KEY_2 check karein; "
-            "Railway Deployments > View Logs bhi dekhein. Dobara /analyze try karein.",
+            f"Error: {error[:500]}\n\n"
+            f"Kya karein: {explain_api_failure(error)}",
         )
     finally:
         try:
@@ -745,5 +791,5 @@ def cancel_command(message: telebot.types.Message) -> None:
 if __name__ == "__main__":
     logger.info("AI evidence-review bot starting")
     logger.info("Authorized users configured: %d", len(AUTHORIZED_USERS))
-    logger.info("Gemini model: %s | API keys configured: %d", GEMINI_MODEL, len(GEMINI_API_KEYS))
+    logger.info("Gemini model: %s | API keys configured: %d | timeout: %d ms", GEMINI_MODEL, len(GEMINI_API_KEYS), GEMINI_TIMEOUT_MS)
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
