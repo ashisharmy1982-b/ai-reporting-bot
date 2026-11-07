@@ -16,17 +16,17 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
     print("❌ ERROR: Missing Environment Variables")
     exit()
 
-# Force specific transport and region to avoid v1beta issues
-genai.configure(
-    api_key=GEMINI_API_KEY,
-    transport="rest" 
-)
+genai.configure(api_key=GEMINI_API_KEY)
 
-# Updated Fallback List (Using most stable models first)
+# 2026 LATEST MODELS (Based on your screenshot)
+# Trying exact API names for 3.8, 3.5, 4 Argon, and fallbacks
 FALLBACK_MODELS = [
-    'gemini-1.5-flash-002',
-    'gemini-1.5-flash',
-    'gemini-pro'
+    'gemini-3.8-flash',      # From your screenshot (3.8 Flash)
+    'gemini-3.5-flash-lite', # From your screenshot (3.5 Flash-Lite)
+    'gemini-4-argon',        # From your screenshot (4 Argon)
+    'gemini-3.1-pro',        # From your screenshot (3.1 Pro)
+    'gemini-2.0-flash-exp',  # Previous gen fallback
+    'gemini-1.5-pro'         # Ultimate legacy fallback
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN, skip_pending=True)
@@ -43,9 +43,8 @@ def extract_text_from_photo(photo_file_id):
         file_info = bot.get_file(photo_file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         image = Image.open(io.BytesIO(downloaded_file))
-        # Try English first, then Hindi if needed
         text = pytesseract.image_to_string(image, lang='eng+hin')
-        return text.strip() if text.strip() else "No text detected in image."
+        return text.strip() if text.strip() else "No text detected."
     except Exception as e:
         return f"OCR Failed: {str(e)}"
 
@@ -166,5 +165,5 @@ def process_final(message, platform, extracted_text):
     
     bot.send_message(message.chat.id, report, parse_mode="Markdown")
 
-print("✅ Bot with Multi-Model Fallback is running on Railway!")
+print("✅ Bot with Gemini 3.x/4.x Models is running on Railway!")
 bot.infinity_polling()
