@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sys
+import time
 from typing import Any
 
 import telebot
@@ -345,47 +346,93 @@ def run_gemini_review(
     )
     contents: Any = [prompt, *images] if images else prompt
     errors: list[str] = []
+    max_attempts_per_key = 3
+    retry_delays_seconds = (3, 8)
+    retryable_status_codes = {408, 500, 502, 503, 504}
 
-    # 504/503/429/5xx can be temporary service or capacity failures. Give each
-    # API key a bounded retry instead of treating a timeout as a bad API key.
-    retry_options = types.HttpRetryOptions(
-        attempts=2,  # maximum total attempts per key, including the first call
-        initial_delay=1.0,
-        max_delay=5.0,
-        exp_base=2.0,
-        jitter=1.0,
-        http_status_codes=[408, 429, 500, 502, 503, 504],
-    )
-
+    # Keep the user's two-key setup and one selected model. A 503 is a Google
+    # service-capacity problem, not proof that an API key is invalid. Retry the
+    # same request with bounded backoff, then move to the second key.
     for index, api_key in enumerate(GEMINI_API_KEYS, start=1):
+        client = None
+        key_error = "No response received."
         try:
             client = genai.Client(
                 api_key=api_key,
-                http_options=types.HttpOptions(
-                    timeout=GEMINI_TIMEOUT_MS,
-                    retry_options=retry_options,
-                ),
+                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
             )
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                    max_output_tokens=1500,
-                ),
-            )
-            parsed = parse_json(response.text or "")
-            return normalize_result(parsed, bool(images)), index
+
+            for attempt in range(1, max_attempts_per_key + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.2,
+                            max_output_tokens=1500,
+                        ),
+                    )
+                    parsed = parse_json(response.text or "")
+                    return normalize_result(parsed, bool(images)), index
+                except Exception as exc:
+                    code = getattr(exc, "code", None)
+                    try:
+                        code = int(code) if code is not None else None
+                    except (TypeError, ValueError):
+                        code = None
+
+                    raw_error = str(exc)
+                    for secret in GEMINI_API_KEYS:
+                        if secret:
+                            raw_error = raw_error.replace(secret, "[REDACTED]")
+                    key_error = raw_error[:250]
+
+                    if code in retryable_status_codes and attempt < max_attempts_per_key:
+                        delay = retry_delays_seconds[attempt - 1]
+                        logger.warning(
+                            "Gemini API key %d got transient HTTP %s on attempt %d/%d; retrying in %ds",
+                            index, code, attempt, max_attempts_per_key, delay,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    # If the SDK error does not expose .code, still recognise the
+                    # standard status prefix in its message for safe retrying.
+                    if code is None:
+                        match = re.search(r"\b(408|500|502|503|504)\b", raw_error)
+                        text_code = int(match.group(1)) if match else None
+                        if text_code in retryable_status_codes and attempt < max_attempts_per_key:
+                            delay = retry_delays_seconds[attempt - 1]
+                            logger.warning(
+                                "Gemini returned HTTP %s on attempt %d/%d; retrying in %ds",
+                                text_code, attempt, max_attempts_per_key, delay,
+                            )
+                            time.sleep(delay)
+                            continue
+
+                    logger.warning(
+                        "Gemini API key %d failed on attempt %d/%d: %s",
+                        index, attempt, max_attempts_per_key, key_error,
+                    )
+                    break
+
         except Exception as exc:
-            raw_error = str(exc)
+            key_error = str(exc)[:250]
             for secret in GEMINI_API_KEYS:
                 if secret:
-                    raw_error = raw_error.replace(secret, "[REDACTED]")
-            errors.append(f"API key {index}: {raw_error[:250]}")
-            logger.warning("Gemini request failed with API key %d: %s", index, raw_error[:250])
+                    key_error = key_error.replace(secret, "[REDACTED]")
+            logger.warning("Could not initialise Gemini client for API key %d: %s", index, key_error)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    logger.debug("Could not close Gemini client for API key %d", index)
 
-    raise RuntimeError("Gemini request failed after retry/failover. " + " | ".join(errors))
+        errors.append(f"API key {index}: {key_error}")
+
+    raise RuntimeError("Gemini review failed after retrying both configured API keys. " + " | ".join(errors))
 
 
 # ---------------------------------------------------------------------------
@@ -707,8 +754,18 @@ def explain_api_failure(error: str) -> str:
             "Google API key invalid ya permission issue lag raha hai. Railway Variables mein dono keys "
             "ke naam/values check karein; key ke aage-peeche spaces na hon aur Gemini API access enabled ho."
         )
-    if "503" in lowered or "service_unavailable" in lowered or "502" in lowered:
-        return "Gemini service abhi temporarily busy/unavailable hai. Kuch der baad /analyze dobara try karein."
+    if "503" in lowered or "service_unavailable" in lowered:
+        return (
+            "503 UNAVAILABLE ka matlab Google ka selected Gemini model abhi high demand / capacity ki wajah se busy hai. "
+            "Ye aam taur par API key galat hone ka error nahi hai. Bot ab har configured key par 3 attempts karta hai "
+            "(3 aur 8 second ke backoff ke saath), phir doosri key try karta hai. Dono keys same model ko call karti hain, "
+            "isliye agar model overloaded rahe to dono fail ho sakti hain. 1-2 minute baad /analyze dobara try karein; "
+            "API keys regenerate karne ki zaroorat nahi. Agar 503 baar-baar aaye, Railway Variables mein "
+            "GEMINI_MODEL ko ek baar ke liye gemini-3.7-flash set karke redeploy karein. Ye ek hi selected model rahega; "
+            "aapki dono Google API keys waise hi use hongi."
+        )
+    if "502" in lowered:
+        return "Google Gemini gateway temporarily unavailable hai. Bot ne retry kiya; kuch der baad dobara try karein."
     return (
         "Railway > Deployments > latest deployment > View Logs mein poora error dekhein. "
         "API key ko chat mein kabhi share na karein."
