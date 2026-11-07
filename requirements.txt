@@ -1,2 +1,4 @@
 pyTelegramBotAPI
 google-generativeai
+Pillow
+pytesseract
