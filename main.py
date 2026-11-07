@@ -41,6 +41,16 @@ for _key_name in ("GEMINI_API_KEY", "GEMINI_API_KEY_2"):
         GEMINI_API_KEYS.append(_key)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Keep the two API keys, but also switch models when Google's selected model is
+# overloaded. These stable Flash alternatives support text + image understanding.
+_fallback_raw = os.getenv(
+    "GEMINI_FALLBACK_MODELS",
+    "gemini-3.6-flash,gemini-3.5-flash-lite",
+)
+GEMINI_MODEL_CANDIDATES = []
+for _model in [GEMINI_MODEL, *[x.strip() for x in _fallback_raw.split(",") if x.strip()]]:
+    if _model and _model not in GEMINI_MODEL_CANDIDATES:
+        GEMINI_MODEL_CANDIDATES.append(_model)
 try:
     GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "180000"))
 except ValueError:
@@ -330,14 +340,28 @@ def normalize_result(data: dict[str, Any], has_images: bool) -> dict[str, Any]:
     }
 
 
+def _http_status_from_error(exc: Exception, message: str) -> int | None:
+    """Extract an HTTP status from google-genai exception variants."""
+    for attr in ("code", "status_code", "http_status"):
+        value = getattr(exc, attr, None)
+        try:
+            if value is not None:
+                parsed = int(value)
+                if 100 <= parsed <= 599:
+                    return parsed
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"\b(400|401|403|404|408|429|500|502|503|504)\b", message)
+    return int(match.group(1)) if match else None
+
+
 def run_gemini_review(
     platform: str,
     account: str,
     context: str,
     images: list[Image.Image],
-) -> tuple[dict[str, Any], int]:
-    # Replace only named placeholders so the JSON example braces in the prompt
-    # remain literal (str.format would treat them as formatting fields).
+) -> tuple[dict[str, Any], int, str]:
+    # Replace only named placeholders so the JSON example braces remain literal.
     prompt = (
         PROMPT_TEMPLATE
         .replace("{platform}", platform[:60])
@@ -346,93 +370,82 @@ def run_gemini_review(
     )
     contents: Any = [prompt, *images] if images else prompt
     errors: list[str] = []
-    max_attempts_per_key = 3
-    retry_delays_seconds = (3, 8)
+    max_attempts_per_key_model = 2
+    retry_delays_seconds = (3,)
     retryable_status_codes = {408, 500, 502, 503, 504}
 
-    # Keep the user's two-key setup and one selected model. A 503 is a Google
-    # service-capacity problem, not proof that an API key is invalid. Retry the
-    # same request with bounded backoff, then move to the second key.
-    for index, api_key in enumerate(GEMINI_API_KEYS, start=1):
-        client = None
-        key_error = "No response received."
-        try:
-            client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-            )
-
-            for attempt in range(1, max_attempts_per_key + 1):
-                try:
-                    response = client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                            max_output_tokens=1500,
-                        ),
-                    )
-                    parsed = parse_json(response.text or "")
-                    return normalize_result(parsed, bool(images)), index
-                except Exception as exc:
-                    code = getattr(exc, "code", None)
+    # Try the configured primary model first, then stable Flash alternatives.
+    # Both Google API keys are retained and tested against each model. Changing
+    # the model is important for 503 capacity errors; changing only the API key
+    # cannot make an overloaded model available.
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        for key_number, api_key in enumerate(GEMINI_API_KEYS, start=1):
+            client = None
+            last_error = "No response received."
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+                )
+                for attempt in range(1, max_attempts_per_key_model + 1):
                     try:
-                        code = int(code) if code is not None else None
-                    except (TypeError, ValueError):
-                        code = None
-
-                    raw_error = str(exc)
-                    for secret in GEMINI_API_KEYS:
-                        if secret:
-                            raw_error = raw_error.replace(secret, "[REDACTED]")
-                    key_error = raw_error[:250]
-
-                    if code in retryable_status_codes and attempt < max_attempts_per_key:
-                        delay = retry_delays_seconds[attempt - 1]
-                        logger.warning(
-                            "Gemini API key %d got transient HTTP %s on attempt %d/%d; retrying in %ds",
-                            index, code, attempt, max_attempts_per_key, delay,
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.2,
+                                max_output_tokens=1500,
+                            ),
                         )
-                        time.sleep(delay)
-                        continue
+                        parsed = parse_json(response.text or "")
+                        return normalize_result(parsed, bool(images)), key_number, model_name
+                    except Exception as exc:
+                        raw_error = str(exc)
+                        for secret in GEMINI_API_KEYS:
+                            if secret:
+                                raw_error = raw_error.replace(secret, "[REDACTED]")
+                        last_error = raw_error[:220]
+                        status = _http_status_from_error(exc, raw_error)
 
-                    # If the SDK error does not expose .code, still recognise the
-                    # standard status prefix in its message for safe retrying.
-                    if code is None:
-                        match = re.search(r"\b(408|500|502|503|504)\b", raw_error)
-                        text_code = int(match.group(1)) if match else None
-                        if text_code in retryable_status_codes and attempt < max_attempts_per_key:
+                        if status in retryable_status_codes and attempt < max_attempts_per_key_model:
                             delay = retry_delays_seconds[attempt - 1]
                             logger.warning(
-                                "Gemini returned HTTP %s on attempt %d/%d; retrying in %ds",
-                                text_code, attempt, max_attempts_per_key, delay,
+                                "Gemini model %s / API key %d returned HTTP %s; retry %d/%d in %ds",
+                                model_name, key_number, status, attempt, max_attempts_per_key_model, delay,
                             )
                             time.sleep(delay)
                             continue
 
-                    logger.warning(
-                        "Gemini API key %d failed on attempt %d/%d: %s",
-                        index, attempt, max_attempts_per_key, key_error,
-                    )
-                    break
+                        logger.warning(
+                            "Gemini model %s / API key %d failed (HTTP %s): %s",
+                            model_name, key_number, status or "unknown", last_error,
+                        )
+                        break
+            except Exception as exc:
+                raw_error = str(exc)
+                for secret in GEMINI_API_KEYS:
+                    if secret:
+                        raw_error = raw_error.replace(secret, "[REDACTED]")
+                last_error = raw_error[:220]
+                logger.warning(
+                    "Could not initialize Gemini model %s with API key %d: %s",
+                    model_name, key_number, last_error,
+                )
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        logger.debug("Could not close Gemini client.")
 
-        except Exception as exc:
-            key_error = str(exc)[:250]
-            for secret in GEMINI_API_KEYS:
-                if secret:
-                    key_error = key_error.replace(secret, "[REDACTED]")
-            logger.warning("Could not initialise Gemini client for API key %d: %s", index, key_error)
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    logger.debug("Could not close Gemini client for API key %d", index)
+            errors.append(f"{model_name} / API key {key_number}: {last_error}")
 
-        errors.append(f"API key {index}: {key_error}")
-
-    raise RuntimeError("Gemini review failed after retrying both configured API keys. " + " | ".join(errors))
+    models_tried = ", ".join(GEMINI_MODEL_CANDIDATES)
+    raise RuntimeError(
+        "All configured Gemini model/API-key combinations failed. "
+        f"Models tried: {models_tried}. " + " | ".join(errors)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +508,7 @@ def reporting_guidance(platform: str, result: dict[str, Any]) -> str:
     )
 
 
-def build_report(platform: str, account: str, context: str, result: dict[str, Any], key_number: int, image_count: int) -> str:
+def build_report(platform: str, account: str, context: str, result: dict[str, Any], key_number: int, model_used: str, image_count: int) -> str:
     issue_labels = {
         "harassment_bullying": "Bullying / harassment concern",
         "hate_or_discrimination": "Hate / discriminatory abuse concern",
@@ -544,7 +557,7 @@ def build_report(platform: str, account: str, context: str, result: dict[str, An
         "OFFICIAL REPORTING GUIDE (YOU SUBMIT IT MANUALLY)\n"
         f"{reporting_guidance(platform, result)}\n\n"
         "Important: Bot username/profile ko online open ya verify nahi karta. Low followers, new ID, anonymity, story post, ya ek gaali alone fake ID ka proof nahi hai. AI result platform ka final decision nahi hai. False ya coordinated reports na karein.\n"
-        f"Gemini model: {GEMINI_MODEL} | Google API key used: {key_number}\n"
+        f"Gemini model: {model_used} | Google API key used: {key_number}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -756,13 +769,10 @@ def explain_api_failure(error: str) -> str:
         )
     if "503" in lowered or "service_unavailable" in lowered:
         return (
-            "503 UNAVAILABLE ka matlab Google ka selected Gemini model abhi high demand / capacity ki wajah se busy hai. "
-            "Ye aam taur par API key galat hone ka error nahi hai. Bot ab har configured key par 3 attempts karta hai "
-            "(3 aur 8 second ke backoff ke saath), phir doosri key try karta hai. Dono keys same model ko call karti hain, "
-            "isliye agar model overloaded rahe to dono fail ho sakti hain. 1-2 minute baad /analyze dobara try karein; "
-            "API keys regenerate karne ki zaroorat nahi. Agar 503 baar-baar aaye, Railway Variables mein "
-            "GEMINI_MODEL ko ek baar ke liye gemini-3.7-flash set karke redeploy karein. Ye ek hi selected model rahega; "
-            "aapki dono Google API keys waise hi use hongi."
+            "503 UNAVAILABLE ka matlab selected Gemini model ki capacity abhi busy hai; ye aam taur par API key ka error nahi hai. "
+            "Ab bot primary model ke baad GEMINI_FALLBACK_MODELS mein diye stable Flash models ko bhi try karta hai, "
+            "aur har model par dono Google API keys use karta hai. API keys regenerate karne ki zaroorat nahi. "
+            "Agar sabhi models par 503 aaye, kuch der baad dobara try karein; Google ki service-side capacity theek hone ka wait karna hoga."
         )
     if "502" in lowered:
         return "Google Gemini gateway temporarily unavailable hai. Bot ne retry kiya; kuch der baad dobara try karein."
@@ -780,8 +790,8 @@ def perform_review(chat_id: int, platform: str, account: str, context: str, imag
         "Bot account ko online open nahi karta; sirf aapke diye details dekhta hai.",
     )
     try:
-        result, key_number = run_gemini_review(platform, account, context, images)
-        report = build_report(platform, account, context, result, key_number, len(images))
+        result, key_number, model_used = run_gemini_review(platform, account, context, images)
+        report = build_report(platform, account, context, result, key_number, model_used, len(images))
         send_long_message(chat_id, report)
     except Exception as exc:
         logger.exception("Review failed")
@@ -848,5 +858,5 @@ def cancel_command(message: telebot.types.Message) -> None:
 if __name__ == "__main__":
     logger.info("AI evidence-review bot starting")
     logger.info("Authorized users configured: %d", len(AUTHORIZED_USERS))
-    logger.info("Gemini model: %s | API keys configured: %d | timeout: %d ms", GEMINI_MODEL, len(GEMINI_API_KEYS), GEMINI_TIMEOUT_MS)
+    logger.info("Gemini models: %s | API keys configured: %d | timeout: %d ms", ",".join(GEMINI_MODEL_CANDIDATES), len(GEMINI_API_KEYS), GEMINI_TIMEOUT_MS)
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
