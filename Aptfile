@@ -1,2 +1,1 @@
-tesseract-ocr
-tesseract-ocr-hin
+# No system OCR package is required. Gemini Vision reads screenshots directly.
